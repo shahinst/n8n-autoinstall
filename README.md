@@ -27,7 +27,7 @@ A fully automated shell script to install, configure, and run [n8n](https://n8n.
 1. Connect to your server via SSH.
 2. Run the following command:
 
-```bash
+
 curl -sSL https://raw.githubusercontent.com/shahinst/n8n-autoinstall/main/install_n8n.sh | bash
 Follow the prompts:
 
@@ -42,10 +42,6 @@ pgsql
 Copy
 Edit
 🎉 n8n has been successfully installed!
-
-🌍 Access it at: https://n8n.domain.com
-👤 Username: admin
-🔑 Password: e53a3d3b525edb534e18bd1127cf8069
 
 📝 Installation Log: /opt/n8n/install.log
 📄 License
