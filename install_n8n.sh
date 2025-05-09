@@ -31,13 +31,20 @@ if [ -d "$N8N_DIR" ]; then
   rm -rf $N8N_DIR
 fi
 
-# 📝 Ask for domain
-read -p "🌐 Enter domain for n8n (e.g. n8n.domain.com): " DOMAIN
+# 🌐 Ask for domain
+read -p "🌐 Enter domain for n8n (leave blank to use server IP): " DOMAIN
+
+if [[ -z "$DOMAIN" ]]; then
+  DOMAIN=$(hostname -I | awk '{print $1}')
+  USE_IP=true
+else
+  USE_IP=false
+fi
 
 mkdir -p $N8N_DIR
 
 echo "📦 Installing dependencies..."
-apt update && apt install -y docker.io docker-compose nginx certbot python3-certbot-nginx
+apt update && apt install -y docker.io docker-compose nginx
 
 systemctl enable docker
 systemctl start docker
@@ -110,22 +117,19 @@ EOF
 ln -sf /etc/nginx/sites-available/n8n /etc/nginx/sites-enabled/n8n
 nginx -t && systemctl reload nginx
 
-echo "🔐 Obtaining SSL certificate..."
-certbot --nginx --non-interactive --agree-tos -m admin@$DOMAIN -d $DOMAIN
+# 🔐 If domain was provided, install SSL
+if [[ "$USE_IP" == false ]]; then
+  echo "🔐 Obtaining SSL certificate..."
+  apt install -y certbot python3-certbot-nginx
+  certbot --nginx --non-interactive --agree-tos -m admin@$DOMAIN -d $DOMAIN
+fi
 
-sleep 10
+# 💬 Final message
+echo -e "\n🎉 n8n has been successfully installed!"
+if [[ "$USE_IP" == true ]]; then
+  echo "🌍 Access it at: http://$DOMAIN"
+else
+  echo "🌍 Access it at: https://$DOMAIN"
+fi
 
-# Display final info
-MESSAGE=$(cat <<EOF
-🎉 n8n has been successfully installed!
-
-🌍 Access it at: https://$DOMAIN
-👤 Username: admin
-🔑 Password: $N8N_PASSWORD
-
-📝 Installation Log: $LOG_FILE
-EOF
-)
-
-echo "$MESSAGE" | tee $LOG_FILE
-echo -e "\n✅ Done! Enjoy using n8n!"
+echo -e "\n📝 Installation Log: $LOG_FILE"
