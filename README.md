@@ -2,7 +2,7 @@
 
 A fully automated shell script to install, configure, and run [n8n](https://n8n.io) on a fresh Ubuntu 24.04 server with Docker, PostgreSQL, and NGINX + SSL using Let's Encrypt.
 
-> ✨ Developed by **Digicloud Company**  
+> ✨ Developed by **shahin salektootoonchi**  
 > 🌍 https://digicloud.host | https://oxincloud.net  
 > 🧑‍💻 GitHub: [@shahinst](https://github.com/shahinst)
 
