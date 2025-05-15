@@ -1,4 +1,4 @@
-# 🚀 n8n Auto Installer for Ubuntu 24.04
+# 🚀 n8n Auto Installer
 
 A fully automated shell script to install, configure, and run [n8n](https://n8n.io) on a fresh Ubuntu 24.04 server with Docker, PostgreSQL, and NGINX + SSL using Let's Encrypt.
 
@@ -17,7 +17,8 @@ A fully automated shell script to install, configure, and run [n8n](https://n8n.
 - 📁 Generates a full installation log at `/opt/n8n/install.log`
 - 🔁 Detects and optionally removes any existing installation
 - 🧠 Smart prompts: asks for domain name and handles clean reinstallation
-
+- 🌍 Configures NGINX reverse proxy with automatic SSL via Let's Encrypt
+- 🌍 Install in Ubuntu 18 , 20 , 22 , 24 | Almalinux 8 , 9 | Centos 8 , 9
 ---
 
 ## 📥 Installation
