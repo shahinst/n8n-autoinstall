@@ -1,6 +1,6 @@
 # 🚀 n8n Auto Installer
 
-A fully automated shell script to install, configure, and run [n8n](https://n8n.io) on a fresh Ubuntu 24.04 server with Docker, PostgreSQL, and NGINX + SSL using Let's Encrypt.
+A fully automated shell script to install, configure, and run [n8n](https://n8n.io) on a fresh Ubuntu 18 , 20 , 22 , 24 | Almalinux 8 , 9 | Centos 8 , 9 server with Docker, PostgreSQL, and NGINX + SSL using Let's Encrypt.
 
 > ✨ Developed by **shahin salektootoonchi**  
 > 🌍 https://digicloud.host | https://oxincloud.net  
