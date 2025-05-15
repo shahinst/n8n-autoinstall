@@ -23,7 +23,7 @@ A fully automated shell script to install, configure, and run [n8n](https://n8n.
 
 ## 📥 Installation
 
-> ⚠️ This script is intended for a **fresh Ubuntu 24.04** server with root access.
+> ⚠️ This script is intended for a **fresh 18 , 20 , 22 , 24 | Almalinux 8 , 9 | Centos 8 , 9** server with root access.
 
 1. Connect to your server via SSH.
 2. Run the following command:
