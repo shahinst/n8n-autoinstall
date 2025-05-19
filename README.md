@@ -37,7 +37,7 @@ An automated installation script for [n8n](https://n8n.io/) workflow automation 
 
 1. Download the script:
 ```bash
-wget https://raw.githubusercontent.com/shahinst/n8n-autoinstall/main/install_n8n.sh
+wget https://github.com/shahinst/n8n-autoinstall/blob/main/install_n8n.sh
 ```
 
 2. Make it executable:
