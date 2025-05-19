@@ -39,7 +39,7 @@ An automated installation script for [n8n](https://n8n.io/) workflow automation 
 curl -fsSL https://raw.githubusercontent.com/shahinst/n8n-autoinstall/main/install_n8n.sh | sudo bash
 ```
 
-### Manual Installation
+### Manual Installation ( Setup in IP or Domain )
 
 1. Download the script:
 ```bash
