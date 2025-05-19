@@ -33,7 +33,7 @@ An automated installation script for [n8n](https://n8n.io/) workflow automation 
 
 ## ⚡ Quick Start
 
-### One-Line Installation
+### One-Line Installation ( Setup in IP )
 
 ```bash
 curl -fsSL https://raw.githubusercontent.com/shahinst/n8n-autoinstall/main/install_n8n.sh | sudo bash
