@@ -1,5 +1,8 @@
 #!/bin/bash
 
+# Modified n8n installation script with fixed syntax error
+# This script has been corrected to address the syntax issue on line 176
+
 # Exit on any error
 set -e
 
@@ -147,14 +150,17 @@ install_dependencies() {
     echo "✅ Dependencies installed successfully!"
 }
 
-# Check for previous installation
+# Check for previous installation - THIS IS THE PROBLEMATIC SECTION THAT'S BEEN FIXED
 if [ -d "$N8N_DIR" ]; then
     echo -e "\n⚠️  n8n is already installed."
-    read -p "❓ Do you want to remove it and reinstall? (yes/no): " CONFIRM
-    if [[ "$CONFIRM" != "yes" ]]; then
+    echo "❓ Do you want to remove it and reinstall? (yes/no): "
+    read CONFIRM
+    
+    if [ "$CONFIRM" != "yes" ]; then
         echo "❌ Installation aborted."
         exit 1
     fi
+    
     echo "🧹 Removing previous installation..."
     docker stop $(docker ps -q --filter ancestor=n8nio/n8n) 2>/dev/null || true
     docker rm $(docker ps -aq --filter ancestor=n8nio/n8n) 2>/dev/null || true
@@ -170,8 +176,10 @@ fi
 mkdir -p $N8N_DIR
 
 # Ask for domain
-read -p "🌐 Enter domain for n8n (leave blank to use server IP): " DOMAIN
-if [[ -z "$DOMAIN" ]]; then
+echo "🌐 Enter domain for n8n (leave blank to use server IP): "
+read DOMAIN
+
+if [ -z "$DOMAIN" ]; then
     DOMAIN=$(hostname -I | awk '{print $1}')
     USE_IP=true
 else
