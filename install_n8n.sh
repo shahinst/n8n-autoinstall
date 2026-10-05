@@ -26,8 +26,18 @@ DB_USER="n8n"
 DB_NAME="n8ndb"
 DB_VERSION="postgres:15"
 DB_TYPE="PostgreSQL 15"
-N8N_IMAGE="docker.n8n.io/n8nio/n8n"
+# Pulled from Docker Hub so a registry mirror can serve it (same image as docker.n8n.io/n8nio/n8n)
+N8N_IMAGE="n8nio/n8n"
 COMPOSE_FALLBACK_VERSION="v2.29.7"
+DOCKER_DAEMON_JSON="/etc/docker/daemon.json"
+DOCKER_HUB_REGISTRY="https://registry-1.docker.io"
+# Docker Hub mirrors, mainly for servers where Docker Hub is blocked (e.g. in Iran)
+DOCKER_MIRRORS=(
+    "https://docker.arvancloud.ir"
+    "https://docker.iranserver.com"
+    "https://registry.docker.ir"
+    "https://mirror.gcr.io"
+)
 # Docker Compose project name is derived from $N8N_DIR ("n8n")
 N8N_VOLUMES="n8n_n8n_data n8n_postgres-data"
 
@@ -268,6 +278,225 @@ install_compose_binary() {
     ln -sf /usr/local/bin/docker-compose /usr/bin/docker-compose
 }
 
+# Install Docker from the official repository, falling back to the distro package
+# when download.docker.com is unreachable (it blocks some countries, e.g. Iran)
+install_docker_apt() {
+    mkdir -p /etc/apt/keyrings
+    if curl -fsSL --max-time 30 "https://download.docker.com/linux/$OS/gpg" | gpg --batch --yes --dearmor -o /etc/apt/keyrings/docker.gpg >> "$LOG_FILE" 2>&1 \
+        && echo "deb [arch=$(dpkg --print-architecture) signed-by=/etc/apt/keyrings/docker.gpg] https://download.docker.com/linux/$OS $(lsb_release -cs) stable" > /etc/apt/sources.list.d/docker.list \
+        && apt-get update -y >> "$LOG_FILE" 2>&1 \
+        && apt-get install -y -qq docker-ce docker-ce-cli containerd.io docker-compose-plugin >> "$LOG_FILE" 2>&1; then
+        return 0
+    fi
+
+    echo "Official Docker repository unreachable, installing the distribution's docker.io package" >> "$LOG_FILE"
+    rm -f /etc/apt/sources.list.d/docker.list
+    apt-get update -y >> "$LOG_FILE" 2>&1
+    apt-get install -y -qq docker.io >> "$LOG_FILE" 2>&1
+}
+
+# Check whether a Docker registry answers its API endpoint (200 or 401 means it is reachable)
+test_registry() {
+    local url=$1
+    local code
+    code=$(curl -s -o /dev/null -w "%{http_code}" --max-time 10 "${url%/}/v2/" 2>/dev/null) || code="000"
+    [[ "$code" == "200" || "$code" == "401" ]]
+}
+
+# Print the registry mirrors currently configured for Docker, one per line
+get_docker_mirrors() {
+    if [ ! -s "$DOCKER_DAEMON_JSON" ]; then
+        return 0
+    fi
+    if command -v python3 &> /dev/null; then
+        python3 - "$DOCKER_DAEMON_JSON" <<'PYEOF' 2>/dev/null || true
+import json, sys
+for mirror in json.load(open(sys.argv[1])).get("registry-mirrors", []):
+    print(mirror)
+PYEOF
+    else
+        grep -A10 '"registry-mirrors"' "$DOCKER_DAEMON_JSON" | sed -n '1,/\]/p' | grep -o 'https\?://[^"]*' || true
+    fi
+}
+
+# Set (or with an empty argument, remove) the Docker Hub mirror and restart Docker
+set_docker_mirror() {
+    local mirror=$1
+
+    mkdir -p "$(dirname "$DOCKER_DAEMON_JSON")"
+    if [ -s "$DOCKER_DAEMON_JSON" ]; then
+        cp "$DOCKER_DAEMON_JSON" "$DOCKER_DAEMON_JSON.bak.$(date '+%Y%m%d-%H%M%S')"
+    fi
+
+    if command -v python3 &> /dev/null; then
+        # Merge into the existing file so other Docker settings are kept
+        if ! python3 - "$DOCKER_DAEMON_JSON" "$mirror" <<'PYEOF' >> "$LOG_FILE" 2>&1; then
+import json, os, sys
+path, mirror = sys.argv[1], sys.argv[2]
+config = {}
+if os.path.exists(path) and os.path.getsize(path) > 0:
+    with open(path) as f:
+        config = json.load(f)
+if mirror:
+    config["registry-mirrors"] = [mirror]
+else:
+    config.pop("registry-mirrors", None)
+with open(path, "w") as f:
+    json.dump(config, f, indent=2)
+    f.write("\n")
+PYEOF
+            echo -e "${RED}❌ Could not update $DOCKER_DAEMON_JSON (is it valid JSON?)${NC}"
+            return 1
+        fi
+    elif [ ! -s "$DOCKER_DAEMON_JSON" ] || ! grep -v 'registry-mirrors\|https\?://\|^[[:space:]]*[]{}[]*[[:space:]]*$' "$DOCKER_DAEMON_JSON" | grep -q '[^[:space:]]'; then
+        # No python3: only safe when the file holds nothing but a mirror list
+        if [ -n "$mirror" ]; then
+            printf '{\n  "registry-mirrors": ["%s"]\n}\n' "$mirror" > "$DOCKER_DAEMON_JSON"
+        else
+            rm -f "$DOCKER_DAEMON_JSON"
+        fi
+    else
+        echo -e "${RED}❌ $DOCKER_DAEMON_JSON has other settings and python3 is not available to merge them${NC}"
+        echo -e "${YELLOW}Add this manually: \"registry-mirrors\": [\"$mirror\"]${NC}"
+        return 1
+    fi
+
+    # Docker reads daemon.json only at startup
+    if command -v docker &> /dev/null && systemctl is-active --quiet docker 2>/dev/null; then
+        echo -e "${CYAN}🔄 Restarting Docker to apply the mirror...${NC}"
+        if ! systemctl restart docker >> "$LOG_FILE" 2>&1; then
+            echo -e "${RED}❌ Docker failed to restart. Check: journalctl -u docker${NC}"
+            return 1
+        fi
+    fi
+
+    if [ -n "$mirror" ]; then
+        echo -e "${GREEN}✅ Docker Hub mirror set to: $mirror${NC}"
+    else
+        echo -e "${GREEN}✅ Docker Hub mirror removed${NC}"
+    fi
+}
+
+# Make sure images can be pulled: if Docker Hub is blocked, offer a working mirror
+ensure_docker_hub_access() {
+    local mirror
+
+    echo -e "${CYAN}🔍 Checking access to Docker Hub...${NC}"
+    if test_registry "$DOCKER_HUB_REGISTRY"; then
+        echo -e "${GREEN}✅ Docker Hub is reachable${NC}"
+        return 0
+    fi
+
+    while read -r mirror; do
+        if [ -n "$mirror" ] && test_registry "$mirror"; then
+            echo -e "${GREEN}✅ Docker Hub is blocked, but the configured mirror works: $mirror${NC}"
+            return 0
+        fi
+    done < <(get_docker_mirrors)
+
+    echo -e "${YELLOW}⚠️  Docker Hub is not reachable from this server (common on servers in Iran)${NC}"
+    echo -e "${CYAN}🔍 Looking for a working Docker Hub mirror...${NC}"
+    for mirror in "${DOCKER_MIRRORS[@]}"; do
+        if test_registry "$mirror"; then
+            echo -e "${GREEN}✅ Found a working mirror: $mirror${NC}"
+            read -p "Use this mirror? (Y/n): " -n 1 -r
+            echo
+            if [[ ! $REPLY =~ ^[Nn]$ ]]; then
+                set_docker_mirror "$mirror" || true
+                return 0
+            fi
+            break
+        fi
+    done
+
+    read -p "Enter a Docker Hub mirror URL (or press Enter to continue without one): " mirror
+    if [ -n "$mirror" ]; then
+        if [[ ! $mirror =~ ^https?://[A-Za-z0-9.-]+(:[0-9]+)?/?$ ]]; then
+            echo -e "${RED}❌ Invalid mirror URL${NC}"
+        elif test_registry "$mirror" || { read -p "Mirror did not respond. Use it anyway? (y/N): " -n 1 -r; echo; [[ $REPLY =~ ^[Yy]$ ]]; }; then
+            set_docker_mirror "$mirror" || true
+            return 0
+        fi
+    fi
+
+    echo -e "${YELLOW}⚠️  Continuing without a mirror, pulling images will probably fail${NC}"
+    echo -e "${YELLOW}⚠️  You can set a mirror later from the menu: Docker registry mirror${NC}"
+    return 0
+}
+
+# Menu to view and change the Docker Hub mirror
+manage_docker_mirror() {
+    clear
+    echo -e "${CYAN}═══════════════════════════════════════════════════════════════${NC}"
+    echo -e "${CYAN}       Docker Registry Mirror${NC}"
+    echo -e "${CYAN}═══════════════════════════════════════════════════════════════${NC}"
+    echo ""
+
+    local current
+    current=$(get_docker_mirrors | paste -sd ' ' -)
+    echo -e "Current mirror: ${GREEN}${current:-none (Docker Hub directly)}${NC}"
+    if test_registry "$DOCKER_HUB_REGISTRY"; then
+        echo -e "Docker Hub:     ${GREEN}✅ Reachable${NC}"
+    else
+        echo -e "Docker Hub:     ${RED}❌ Not reachable${NC}"
+    fi
+    echo ""
+    echo -e "${CYAN}Testing mirrors...${NC}"
+
+    local i=1
+    local mirror
+    for mirror in "${DOCKER_MIRRORS[@]}"; do
+        if test_registry "$mirror"; then
+            echo -e "  $i. $mirror ${GREEN}✅${NC}"
+        else
+            echo -e "  $i. $mirror ${RED}❌${NC}"
+        fi
+        i=$((i + 1))
+    done
+    local custom_option=$i
+    local remove_option=$((i + 1))
+    local back_option=$((i + 2))
+    echo "  $custom_option. Enter a custom mirror URL"
+    echo "  $remove_option. Remove mirror (use Docker Hub directly)"
+    echo "  $back_option. Back to menu"
+    echo ""
+    read -p "Choose an option (1-$back_option): " choice
+
+    mirror=""
+    if [[ $choice =~ ^[0-9]+$ ]] && [ "$choice" -ge 1 ] && [ "$choice" -lt "$custom_option" ]; then
+        mirror=${DOCKER_MIRRORS[$((choice - 1))]}
+    elif [ "$choice" = "$custom_option" ]; then
+        read -p "Mirror URL (e.g. https://mirror.example.com): " mirror
+        if [[ ! $mirror =~ ^https?://[A-Za-z0-9.-]+(:[0-9]+)?/?$ ]]; then
+            echo -e "${RED}❌ Invalid mirror URL${NC}"
+            read -p "Press Enter to continue..."
+            return
+        fi
+    elif [ "$choice" = "$remove_option" ]; then
+        set_docker_mirror "" || true
+        read -p "Press Enter to continue..."
+        return
+    elif [ "$choice" = "$back_option" ]; then
+        return
+    else
+        echo -e "${RED}Invalid option${NC}"
+        read -p "Press Enter to continue..."
+        return
+    fi
+
+    if ! test_registry "$mirror"; then
+        read -p "This mirror did not respond. Use it anyway? (y/N): " -n 1 -r
+        echo
+        if [[ ! $REPLY =~ ^[Yy]$ ]]; then
+            return
+        fi
+    fi
+
+    set_docker_mirror "$mirror" || true
+    echo ""
+    read -p "Press Enter to continue..."
+}
+
 # Function to install dependencies
 install_dependencies() {
     echo ""
@@ -289,19 +518,9 @@ install_dependencies() {
             
             # Install Docker if not present
             if ! command -v docker &> /dev/null; then
-                current_step=$((current_step + 1))
-                show_progress $current_step $total_steps "Adding Docker GPG key..."
-                mkdir -p /etc/apt/keyrings
-                curl -fsSL https://download.docker.com/linux/$OS/gpg | gpg --batch --yes --dearmor -o /etc/apt/keyrings/docker.gpg >> "$LOG_FILE" 2>&1
-                
-                current_step=$((current_step + 1))
-                show_progress $current_step $total_steps "Adding Docker repository..."
-                echo "deb [arch=$(dpkg --print-architecture) signed-by=/etc/apt/keyrings/docker.gpg] https://download.docker.com/linux/$OS $(lsb_release -cs) stable" | tee /etc/apt/sources.list.d/docker.list > /dev/null
-                apt-get update -y >> "$LOG_FILE" 2>&1
-                
-                current_step=$((current_step + 1))
+                current_step=$((current_step + 3))
                 show_progress $current_step $total_steps "Installing Docker Engine..."
-                apt-get install -y -qq docker-ce docker-ce-cli containerd.io docker-compose-plugin >> "$LOG_FILE" 2>&1
+                install_docker_apt
             else
                 current_step=$((current_step + 3))
                 show_progress $current_step $total_steps "Docker already installed, skipping..."
@@ -312,7 +531,9 @@ install_dependencies() {
             if ! docker compose version &> /dev/null && ! command -v docker-compose &> /dev/null; then
                 current_step=$((current_step + 1))
                 show_progress $current_step $total_steps "Installing Docker Compose..."
-                apt-get install -y -qq docker-compose-plugin >> "$LOG_FILE" 2>&1 || true
+                apt-get install -y -qq docker-compose-plugin >> "$LOG_FILE" 2>&1 \
+                    || apt-get install -y -qq docker-compose-v2 >> "$LOG_FILE" 2>&1 \
+                    || true
 
                 if ! docker compose version &> /dev/null; then
                     install_compose_binary
@@ -946,6 +1167,9 @@ install_with_domain() {
     # Install dependencies (called directly so "set -e" stops on any failure)
     install_dependencies
     
+    # Offer a registry mirror if Docker Hub is blocked
+    ensure_docker_hub_access
+    
     # Create docker-compose file (initially without SSL)
     echo -e "${CYAN}📄 Creating docker-compose configuration...${NC}"
     create_docker_compose "$DOMAIN" false "$DB_PASS" "$ENCRYPTION_KEY"
@@ -1102,6 +1326,9 @@ install_without_domain() {
     
     # Install dependencies (called directly so "set -e" stops on any failure)
     install_dependencies
+    
+    # Offer a registry mirror if Docker Hub is blocked
+    ensure_docker_hub_access
     
     # Create docker-compose file
     echo -e "${CYAN}📄 Creating docker-compose configuration...${NC}"
@@ -1410,6 +1637,11 @@ show_status() {
     echo -e "${GREEN}Database:${NC} $DB_TYPE"
     echo ""
     
+    local mirrors
+    mirrors=$(get_docker_mirrors | paste -sd ' ' -)
+    echo -e "${GREEN}Docker mirror:${NC} ${mirrors:-none}"
+    echo ""
+    
     if [ -f "$N8N_DIR/database_info.txt" ]; then
         echo -e "${CYAN}Database info available at: $N8N_DIR/database_info.txt${NC}"
     fi
@@ -1465,11 +1697,12 @@ show_menu() {
         echo "  3. Reinstall n8n"
         echo "  4. Change n8n domain"
         echo "  5. Show status & info"
-        echo "  6. Exit"
+        echo "  6. Docker registry mirror"
+        echo "  7. Exit"
         echo ""
         echo "════════════════════════════════════════"
         echo ""
-        read -p "Choose an option (1-6): " choice
+        read -p "Choose an option (1-7): " choice
         
         case $choice in
             1)
@@ -1488,6 +1721,9 @@ show_menu() {
                 show_status
                 ;;
             6)
+                manage_docker_mirror
+                ;;
+            7)
                 echo ""
                 echo -e "${GREEN}👋 Goodbye!${NC}"
                 echo ""
@@ -1561,6 +1797,7 @@ EOFSERVICE
     echo "   • Reinstall n8n"
     echo "   • Change domain settings"
     echo "   • View status and information"
+    echo "   • Set a Docker registry mirror"
     echo ""
     echo -e "${YELLOW}⚠️  Always use 'sudo n8n' to manage your installation${NC}"
     echo ""

@@ -20,6 +20,7 @@ An automated installation script for [n8n](https://n8n.io/) workflow automation 
 - 🔄 **Fallback Docker Compose installation** (plugin or standalone binary, x86_64/ARM)
 - 💾 **Backup before reinstall** - existing data is backed up before it is removed
 - 🛡️ **Safe for shared servers** - only n8n's own Nginx config is touched
+- 🪞 **Docker registry mirror** - detects when Docker Hub is blocked (e.g. servers in Iran) and sets up a working mirror
 - 📊 **Real-time status monitoring**
 - 🎨 **Color-coded interface** for better user experience
 
@@ -80,7 +81,8 @@ Service: 🟢 Running
   3. Reinstall n8n
   4. Change n8n domain
   5. Show status & info
-  6. Exit
+  6. Docker registry mirror
+  7. Exit
 
 ════════════════════════════════════════
 ```
@@ -126,7 +128,17 @@ Intelligent domain management with multiple options:
 #### 5️⃣ Show Status & Info
 - Shows the domain/IP, SSL state and container status
 
-#### 6️⃣ Exit
+#### 6️⃣ Docker Registry Mirror
+- Shows the current mirror and whether Docker Hub is reachable
+- Tests the built-in mirrors and lets you pick one:
+  - `https://docker.arvancloud.ir`
+  - `https://docker.iranserver.com`
+  - `https://registry.docker.ir`
+  - `https://mirror.gcr.io`
+- Accepts a custom mirror URL, or removes the mirror
+- Writes `registry-mirrors` to `/etc/docker/daemon.json` (other settings are kept, a backup is made) and restarts Docker
+
+#### 7️⃣ Exit
 - Safely exits the management menu
 
 ## 🔧 What the Script Does
@@ -135,6 +147,8 @@ Intelligent domain management with multiple options:
 - Automatically detects your operating system
 - Installs Docker, Docker Compose, and Nginx
 - Installs DNS utilities for domain validation
+- Falls back to the distribution's `docker.io` package if `download.docker.com` is unreachable
+- Checks access to Docker Hub and, if it is blocked, offers a working registry mirror
 - Configures services to start automatically
 
 ### 2. Domain Validation (for domain installations)
@@ -293,6 +307,20 @@ Your workflows and credentials are kept. ⚠️ Don't use the Reinstall option t
 2. Check nginx status: `systemctl status nginx`
 3. Check firewall: `ufw status` or `firewall-cmd --list-all`
 4. Check n8n locally on the server: `curl -I http://127.0.0.1:5678`
+
+#### Pulling images fails (Docker Hub blocked)
+Docker Hub blocks some countries (for example Iran). Set a mirror from the menu:
+```bash
+sudo n8n
+# Choose option 6 (Docker registry mirror)
+```
+Or configure it manually in `/etc/docker/daemon.json`:
+```json
+{
+  "registry-mirrors": ["https://docker.arvancloud.ir"]
+}
+```
+then run `sudo systemctl restart docker`.
 
 #### Service menu not working
 ```bash
