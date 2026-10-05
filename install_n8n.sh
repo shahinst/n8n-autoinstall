@@ -1,11 +1,12 @@
 #!/bin/bash
 
-# n8n Service Installation Script - FIXED VERSION
+# n8n Service Installation Script
 # Auto-installs n8n as a system service with management menu
 # Created by Digicloud Company
 
-# Exit on any error
+# Exit on any error (including failures inside pipelines such as "cmd | tee")
 set -e
+set -o pipefail
 
 # Set non-interactive mode for all installations
 export DEBIAN_FRONTEND=noninteractive
@@ -16,11 +17,29 @@ N8N_DIR="/opt/n8n"
 DOCKER_COMPOSE_FILE="$N8N_DIR/docker-compose.yml"
 LOG_FILE="$N8N_DIR/install.log"
 SERVICE_FILE="/usr/local/bin/n8n"
+SERVICE_SCRIPT="/opt/n8n_service.sh"
+SERVICE_MARKER="# n8n Service Management Script"
+SCRIPT_URL="https://raw.githubusercontent.com/shahinst/n8n-autoinstall/main/install_n8n.sh"
 CONFIG_FILE="$N8N_DIR/config.txt"
+BACKUP_DIR="/root/n8n-backups"
 DB_USER="n8n"
 DB_NAME="n8ndb"
 DB_VERSION="postgres:15"
 DB_TYPE="PostgreSQL 15"
+# Pulled from Docker Hub so a registry mirror can serve it (same image as docker.n8n.io/n8nio/n8n)
+N8N_IMAGE="n8nio/n8n"
+COMPOSE_FALLBACK_VERSION="v2.29.7"
+DOCKER_DAEMON_JSON="/etc/docker/daemon.json"
+DOCKER_HUB_REGISTRY="https://registry-1.docker.io"
+# Docker Hub mirrors, mainly for servers where Docker Hub is blocked (e.g. in Iran)
+DOCKER_MIRRORS=(
+    "https://docker.arvancloud.ir"
+    "https://docker.iranserver.com"
+    "https://registry.docker.ir"
+    "https://mirror.gcr.io"
+)
+# Docker Compose project name is derived from $N8N_DIR ("n8n")
+N8N_VOLUMES="n8n_n8n_data n8n_postgres-data"
 
 # Colors
 RED='\033[0;31m'
@@ -46,10 +65,130 @@ show_progress() {
     local empty=$((50 - filled))
     
     printf "\r${GREEN}[%s%s] %d%% - %s${NC}" \
-        "$(printf '%*s' "$filled" | tr ' ' '█')" \
-        "$(printf '%*s' "$empty" | tr ' ' '░')" \
+        "$(printf '%*s' "$filled" '' | sed 's/ /█/g')" \
+        "$(printf '%*s' "$empty" '' | sed 's/ /░/g')" \
         "$percent" \
         "$message"
+}
+
+# Run Docker Compose, preferring the v2 plugin over the legacy binary
+compose() {
+    if docker compose version &> /dev/null; then
+        docker compose "$@"
+    elif command -v docker-compose &> /dev/null; then
+        docker-compose "$@"
+    else
+        echo -e "${RED}❌ Docker Compose is not installed${NC}"
+        return 1
+    fi
+}
+
+# Recreate the n8n containers from the current docker-compose file
+restart_n8n() {
+    echo -e "${CYAN}🔄 Restarting n8n...${NC}"
+    cd "$N8N_DIR"
+    compose down >> "$LOG_FILE" 2>&1 || true
+    sleep 3
+    if ! compose up -d >> "$LOG_FILE" 2>&1; then
+        echo -e "${RED}❌ Failed to start n8n containers. Check $LOG_FILE${NC}"
+        return 1
+    fi
+    wait_for_n8n || true
+}
+
+# Show the last lines of the n8n container logs
+show_n8n_logs() {
+    local lines=${1:-20}
+    (cd "$N8N_DIR" && compose logs --tail "$lines" n8n 2>&1) || true
+}
+
+# Get the server's public IPv4 address (falls back to the first local address)
+get_server_ip() {
+    local ip=""
+    local service
+    for service in https://api.ipify.org https://ifconfig.me https://icanhazip.com; do
+        ip=$(curl -4 -fsS --max-time 5 "$service" 2>/dev/null | tr -d '[:space:]') || ip=""
+        if [[ $ip =~ ^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+            echo "$ip"
+            return 0
+        fi
+    done
+    hostname -I | awk '{print $1}'
+}
+
+# Detect the host timezone for n8n's schedule nodes
+get_timezone() {
+    local tz=""
+    if command -v timedatectl &> /dev/null; then
+        tz=$(timedatectl show -p Timezone --value 2>/dev/null) || tz=""
+    fi
+    if [ -z "$tz" ] && [ -f /etc/timezone ]; then
+        tz=$(cat /etc/timezone)
+    fi
+    echo "${tz:-UTC}"
+}
+
+# Ask before wiping an existing installation and optionally back it up
+confirm_clean() {
+    if [ "$SKIP_CLEAN_CONFIRM" = true ]; then
+        return 0
+    fi
+    
+    BACKUP_BEFORE_CLEAN=false
+
+    if [ ! -f "$CONFIG_FILE" ] && [ ! -f "$DOCKER_COMPOSE_FILE" ]; then
+        return 0
+    fi
+
+    echo -e "${RED}⚠️  An existing n8n installation was found in $N8N_DIR${NC}"
+    echo -e "${RED}⚠️  Continuing will remove all existing n8n data and workflows!${NC}"
+    echo ""
+    read -p "Are you sure you want to continue? (y/N): " -n 1 -r
+    echo
+    if [[ ! $REPLY =~ ^[Yy]$ ]]; then
+        return 1
+    fi
+
+    read -p "Create a backup of the existing data first? (Y/n): " -n 1 -r
+    echo
+    if [[ ! $REPLY =~ ^[Nn]$ ]]; then
+        BACKUP_BEFORE_CLEAN=true
+    else
+        BACKUP_BEFORE_CLEAN=false
+    fi
+    return 0
+}
+
+# Back up the n8n Docker volumes and configuration (containers must be stopped)
+backup_installation() {
+    local stamp
+    stamp=$(date '+%Y%m%d-%H%M%S')
+    local target="$BACKUP_DIR/$stamp"
+    local volume
+
+    echo -e "${CYAN}💾 Backing up n8n data to $target...${NC}"
+    mkdir -p "$target"
+    chmod 700 "$BACKUP_DIR"
+
+    cp -a "$CONFIG_FILE" "$DOCKER_COMPOSE_FILE" "$N8N_DIR/database_info.txt" "$target/" 2>/dev/null || true
+
+    for volume in $N8N_VOLUMES; do
+        if docker volume inspect "$volume" &> /dev/null; then
+            if docker run --rm -v "$volume":/data:ro -v "$target":/backup alpine \
+                tar czf "/backup/$volume.tar.gz" -C /data . >> "$LOG_FILE" 2>&1; then
+                echo -e "${GREEN}✅ Volume $volume backed up${NC}"
+            else
+                echo -e "${RED}❌ Failed to back up volume $volume${NC}"
+                read -p "Continue without a complete backup? (y/N): " -n 1 -r
+                echo
+                if [[ ! $REPLY =~ ^[Yy]$ ]]; then
+                    return 1
+                fi
+            fi
+        fi
+    done
+
+    echo -e "${GREEN}✅ Backup saved to: $target${NC}"
 }
 
 # Function to detect OS
@@ -65,7 +204,7 @@ detect_os() {
     fi
 }
 
-# Function to validate domain - FIXED
+# Function to validate domain
 validate_domain() {
     local domain=$1
     
@@ -82,18 +221,14 @@ validate_domain() {
     # Check DNS resolution - IMPROVED
     echo -e "${YELLOW}🔍 Checking DNS resolution for $domain...${NC}"
     
-    local dns_resolved=false
-    
-    # Try multiple DNS lookup methods
-    if host $domain >/dev/null 2>&1; then
-        dns_resolved=true
-    elif nslookup $domain >/dev/null 2>&1; then
-        dns_resolved=true
-    elif dig +short $domain >/dev/null 2>&1 && [ -n "$(dig +short $domain)" ]; then
-        dns_resolved=true
+    # getent is always available; dig/host may not be installed yet on a fresh server
+    DOMAIN_IP=$(getent ahostsv4 "$domain" 2>/dev/null | awk '{print $1; exit}') || DOMAIN_IP=""
+
+    if [ -z "$DOMAIN_IP" ] && command -v dig &> /dev/null; then
+        DOMAIN_IP=$(dig +short A "$domain" 2>/dev/null | grep -E '^[0-9.]+$' | head -1) || DOMAIN_IP=""
     fi
-    
-    if [ "$dns_resolved" = false ]; then
+
+    if [ -z "$DOMAIN_IP" ]; then
         echo -e "${YELLOW}⚠️  Warning: Domain does not resolve to any IP address${NC}"
         echo -e "${YELLOW}⚠️  Make sure your DNS is properly configured before continuing${NC}"
         echo -e "${YELLOW}⚠️  SSL installation will fail if DNS is not pointing to this server${NC}"
@@ -106,18 +241,13 @@ validate_domain() {
         return 0
     fi
     
-    # Check if domain points to this server
-    SERVER_IP=$(hostname -I | awk '{print $1}')
-    DOMAIN_IP=$(dig +short $domain 2>/dev/null | grep -E '^[0-9.]+$' | head -1)
-    
-    if [ -z "$DOMAIN_IP" ]; then
-        DOMAIN_IP=$(host $domain 2>/dev/null | grep "has address" | awk '{print $4}' | head -1)
-    fi
-    
+    # Check if domain points to this server (public IP, or any local address)
+    SERVER_IP=$(get_server_ip)
+
     echo -e "${BLUE}Server IP: $SERVER_IP${NC}"
     echo -e "${BLUE}Domain IP: $DOMAIN_IP${NC}"
-    
-    if [ -n "$DOMAIN_IP" ] && [ "$DOMAIN_IP" != "$SERVER_IP" ]; then
+
+    if [ "$DOMAIN_IP" != "$SERVER_IP" ] && ! hostname -I | tr ' ' '\n' | grep -qx "$DOMAIN_IP"; then
         echo -e "${YELLOW}⚠️  Warning: Domain points to $DOMAIN_IP but server IP is $SERVER_IP${NC}"
         echo -e "${YELLOW}⚠️  SSL installation will fail if DNS is not correctly configured${NC}"
         read -p "Do you want to continue anyway? (y/N): " -n 1 -r
@@ -130,6 +260,241 @@ validate_domain() {
     fi
     
     return 0
+}
+
+# Download the standalone Docker Compose binary for this CPU architecture
+install_compose_binary() {
+    local arch
+    case "$(uname -m)" in
+        x86_64|amd64) arch="x86_64" ;;
+        aarch64|arm64) arch="aarch64" ;;
+        armv7l) arch="armv7" ;;
+        *) arch="$(uname -m)" ;;
+    esac
+
+    curl -fsSL "https://github.com/docker/compose/releases/download/${COMPOSE_FALLBACK_VERSION}/docker-compose-linux-${arch}" \
+        -o /usr/local/bin/docker-compose >> "$LOG_FILE" 2>&1
+    chmod +x /usr/local/bin/docker-compose
+    ln -sf /usr/local/bin/docker-compose /usr/bin/docker-compose
+}
+
+# Install Docker from the official repository, falling back to the distro package
+# when download.docker.com is unreachable (it blocks some countries, e.g. Iran)
+install_docker_apt() {
+    mkdir -p /etc/apt/keyrings
+    if curl -fsSL --max-time 30 "https://download.docker.com/linux/$OS/gpg" | gpg --batch --yes --dearmor -o /etc/apt/keyrings/docker.gpg >> "$LOG_FILE" 2>&1 \
+        && echo "deb [arch=$(dpkg --print-architecture) signed-by=/etc/apt/keyrings/docker.gpg] https://download.docker.com/linux/$OS $(lsb_release -cs) stable" > /etc/apt/sources.list.d/docker.list \
+        && apt-get update -y >> "$LOG_FILE" 2>&1 \
+        && apt-get install -y -qq docker-ce docker-ce-cli containerd.io docker-compose-plugin >> "$LOG_FILE" 2>&1; then
+        return 0
+    fi
+
+    echo "Official Docker repository unreachable, installing the distribution's docker.io package" >> "$LOG_FILE"
+    rm -f /etc/apt/sources.list.d/docker.list
+    apt-get update -y >> "$LOG_FILE" 2>&1
+    apt-get install -y -qq docker.io >> "$LOG_FILE" 2>&1
+}
+
+# Check whether a Docker registry answers its API endpoint (200 or 401 means it is reachable)
+test_registry() {
+    local url=$1
+    local code
+    code=$(curl -s -o /dev/null -w "%{http_code}" --max-time 10 "${url%/}/v2/" 2>/dev/null) || code="000"
+    [[ "$code" == "200" || "$code" == "401" ]]
+}
+
+# Print the registry mirrors currently configured for Docker, one per line
+get_docker_mirrors() {
+    if [ ! -s "$DOCKER_DAEMON_JSON" ]; then
+        return 0
+    fi
+    if command -v python3 &> /dev/null; then
+        python3 - "$DOCKER_DAEMON_JSON" <<'PYEOF' 2>/dev/null || true
+import json, sys
+for mirror in json.load(open(sys.argv[1])).get("registry-mirrors", []):
+    print(mirror)
+PYEOF
+    else
+        grep -A10 '"registry-mirrors"' "$DOCKER_DAEMON_JSON" | sed -n '1,/\]/p' | grep -o 'https\?://[^"]*' || true
+    fi
+}
+
+# Set (or with an empty argument, remove) the Docker Hub mirror and restart Docker
+set_docker_mirror() {
+    local mirror=$1
+
+    mkdir -p "$(dirname "$DOCKER_DAEMON_JSON")"
+    if [ -s "$DOCKER_DAEMON_JSON" ]; then
+        cp "$DOCKER_DAEMON_JSON" "$DOCKER_DAEMON_JSON.bak.$(date '+%Y%m%d-%H%M%S')"
+    fi
+
+    if command -v python3 &> /dev/null; then
+        # Merge into the existing file so other Docker settings are kept
+        if ! python3 - "$DOCKER_DAEMON_JSON" "$mirror" <<'PYEOF' >> "$LOG_FILE" 2>&1; then
+import json, os, sys
+path, mirror = sys.argv[1], sys.argv[2]
+config = {}
+if os.path.exists(path) and os.path.getsize(path) > 0:
+    with open(path) as f:
+        config = json.load(f)
+if mirror:
+    config["registry-mirrors"] = [mirror]
+else:
+    config.pop("registry-mirrors", None)
+with open(path, "w") as f:
+    json.dump(config, f, indent=2)
+    f.write("\n")
+PYEOF
+            echo -e "${RED}❌ Could not update $DOCKER_DAEMON_JSON (is it valid JSON?)${NC}"
+            return 1
+        fi
+    elif [ ! -s "$DOCKER_DAEMON_JSON" ] || ! grep -v 'registry-mirrors\|https\?://\|^[[:space:]]*[]{}[]*[[:space:]]*$' "$DOCKER_DAEMON_JSON" | grep -q '[^[:space:]]'; then
+        # No python3: only safe when the file holds nothing but a mirror list
+        if [ -n "$mirror" ]; then
+            printf '{\n  "registry-mirrors": ["%s"]\n}\n' "$mirror" > "$DOCKER_DAEMON_JSON"
+        else
+            rm -f "$DOCKER_DAEMON_JSON"
+        fi
+    else
+        echo -e "${RED}❌ $DOCKER_DAEMON_JSON has other settings and python3 is not available to merge them${NC}"
+        echo -e "${YELLOW}Add this manually: \"registry-mirrors\": [\"$mirror\"]${NC}"
+        return 1
+    fi
+
+    # Docker reads daemon.json only at startup
+    if command -v docker &> /dev/null && systemctl is-active --quiet docker 2>/dev/null; then
+        echo -e "${CYAN}🔄 Restarting Docker to apply the mirror...${NC}"
+        if ! systemctl restart docker >> "$LOG_FILE" 2>&1; then
+            echo -e "${RED}❌ Docker failed to restart. Check: journalctl -u docker${NC}"
+            return 1
+        fi
+    fi
+
+    if [ -n "$mirror" ]; then
+        echo -e "${GREEN}✅ Docker Hub mirror set to: $mirror${NC}"
+    else
+        echo -e "${GREEN}✅ Docker Hub mirror removed${NC}"
+    fi
+}
+
+# Make sure images can be pulled: if Docker Hub is blocked, offer a working mirror
+ensure_docker_hub_access() {
+    local mirror
+
+    echo -e "${CYAN}🔍 Checking access to Docker Hub...${NC}"
+    if test_registry "$DOCKER_HUB_REGISTRY"; then
+        echo -e "${GREEN}✅ Docker Hub is reachable${NC}"
+        return 0
+    fi
+
+    while read -r mirror; do
+        if [ -n "$mirror" ] && test_registry "$mirror"; then
+            echo -e "${GREEN}✅ Docker Hub is blocked, but the configured mirror works: $mirror${NC}"
+            return 0
+        fi
+    done < <(get_docker_mirrors)
+
+    echo -e "${YELLOW}⚠️  Docker Hub is not reachable from this server (common on servers in Iran)${NC}"
+    echo -e "${CYAN}🔍 Looking for a working Docker Hub mirror...${NC}"
+    for mirror in "${DOCKER_MIRRORS[@]}"; do
+        if test_registry "$mirror"; then
+            echo -e "${GREEN}✅ Found a working mirror: $mirror${NC}"
+            read -p "Use this mirror? (Y/n): " -n 1 -r
+            echo
+            if [[ ! $REPLY =~ ^[Nn]$ ]]; then
+                set_docker_mirror "$mirror" || true
+                return 0
+            fi
+            break
+        fi
+    done
+
+    read -p "Enter a Docker Hub mirror URL (or press Enter to continue without one): " mirror
+    if [ -n "$mirror" ]; then
+        if [[ ! $mirror =~ ^https?://[A-Za-z0-9.-]+(:[0-9]+)?/?$ ]]; then
+            echo -e "${RED}❌ Invalid mirror URL${NC}"
+        elif test_registry "$mirror" || { read -p "Mirror did not respond. Use it anyway? (y/N): " -n 1 -r; echo; [[ $REPLY =~ ^[Yy]$ ]]; }; then
+            set_docker_mirror "$mirror" || true
+            return 0
+        fi
+    fi
+
+    echo -e "${YELLOW}⚠️  Continuing without a mirror, pulling images will probably fail${NC}"
+    echo -e "${YELLOW}⚠️  You can set a mirror later from the menu: Docker registry mirror${NC}"
+    return 0
+}
+
+# Menu to view and change the Docker Hub mirror
+manage_docker_mirror() {
+    clear
+    echo -e "${CYAN}═══════════════════════════════════════════════════════════════${NC}"
+    echo -e "${CYAN}       Docker Registry Mirror${NC}"
+    echo -e "${CYAN}═══════════════════════════════════════════════════════════════${NC}"
+    echo ""
+
+    local current
+    current=$(get_docker_mirrors | paste -sd ' ' -)
+    echo -e "Current mirror: ${GREEN}${current:-none (Docker Hub directly)}${NC}"
+    if test_registry "$DOCKER_HUB_REGISTRY"; then
+        echo -e "Docker Hub:     ${GREEN}✅ Reachable${NC}"
+    else
+        echo -e "Docker Hub:     ${RED}❌ Not reachable${NC}"
+    fi
+    echo ""
+    echo -e "${CYAN}Testing mirrors...${NC}"
+
+    local i=1
+    local mirror
+    for mirror in "${DOCKER_MIRRORS[@]}"; do
+        if test_registry "$mirror"; then
+            echo -e "  $i. $mirror ${GREEN}✅${NC}"
+        else
+            echo -e "  $i. $mirror ${RED}❌${NC}"
+        fi
+        i=$((i + 1))
+    done
+    local custom_option=$i
+    local remove_option=$((i + 1))
+    local back_option=$((i + 2))
+    echo "  $custom_option. Enter a custom mirror URL"
+    echo "  $remove_option. Remove mirror (use Docker Hub directly)"
+    echo "  $back_option. Back to menu"
+    echo ""
+    read -p "Choose an option (1-$back_option): " choice
+
+    mirror=""
+    if [[ $choice =~ ^[0-9]+$ ]] && [ "$choice" -ge 1 ] && [ "$choice" -lt "$custom_option" ]; then
+        mirror=${DOCKER_MIRRORS[$((choice - 1))]}
+    elif [ "$choice" = "$custom_option" ]; then
+        read -p "Mirror URL (e.g. https://mirror.example.com): " mirror
+        if [[ ! $mirror =~ ^https?://[A-Za-z0-9.-]+(:[0-9]+)?/?$ ]]; then
+            echo -e "${RED}❌ Invalid mirror URL${NC}"
+            read -p "Press Enter to continue..."
+            return
+        fi
+    elif [ "$choice" = "$remove_option" ]; then
+        set_docker_mirror "" || true
+        read -p "Press Enter to continue..."
+        return
+    elif [ "$choice" = "$back_option" ]; then
+        return
+    else
+        echo -e "${RED}Invalid option${NC}"
+        read -p "Press Enter to continue..."
+        return
+    fi
+
+    if ! test_registry "$mirror"; then
+        read -p "This mirror did not respond. Use it anyway? (y/N): " -n 1 -r
+        echo
+        if [[ ! $REPLY =~ ^[Yy]$ ]]; then
+            return
+        fi
+    fi
+
+    set_docker_mirror "$mirror" || true
+    echo ""
+    read -p "Press Enter to continue..."
 }
 
 # Function to install dependencies
@@ -153,19 +518,9 @@ install_dependencies() {
             
             # Install Docker if not present
             if ! command -v docker &> /dev/null; then
-                current_step=$((current_step + 1))
-                show_progress $current_step $total_steps "Adding Docker GPG key..."
-                mkdir -p /etc/apt/keyrings
-                curl -fsSL https://download.docker.com/linux/$OS/gpg | gpg --dearmor -o /etc/apt/keyrings/docker.gpg >> "$LOG_FILE" 2>&1
-                
-                current_step=$((current_step + 1))
-                show_progress $current_step $total_steps "Adding Docker repository..."
-                echo "deb [arch=$(dpkg --print-architecture) signed-by=/etc/apt/keyrings/docker.gpg] https://download.docker.com/linux/$OS $(lsb_release -cs) stable" | tee /etc/apt/sources.list.d/docker.list > /dev/null
-                apt-get update -y >> "$LOG_FILE" 2>&1
-                
-                current_step=$((current_step + 1))
+                current_step=$((current_step + 3))
                 show_progress $current_step $total_steps "Installing Docker Engine..."
-                apt-get install -y -qq docker-ce docker-ce-cli containerd.io docker-compose-plugin >> "$LOG_FILE" 2>&1
+                install_docker_apt
             else
                 current_step=$((current_step + 3))
                 show_progress $current_step $total_steps "Docker already installed, skipping..."
@@ -173,14 +528,15 @@ install_dependencies() {
             fi
             
             # Install Docker Compose
-            if ! command -v docker-compose &> /dev/null; then
+            if ! docker compose version &> /dev/null && ! command -v docker-compose &> /dev/null; then
                 current_step=$((current_step + 1))
                 show_progress $current_step $total_steps "Installing Docker Compose..."
-                apt-get install -y -qq docker-compose >> "$LOG_FILE" 2>&1
-                
-                if ! command -v docker-compose &> /dev/null; then
-                    curl -SL https://github.com/docker/compose/releases/download/v2.16.0/docker-compose-linux-x86_64 -o /usr/local/bin/docker-compose >> "$LOG_FILE" 2>&1
-                    chmod +x /usr/local/bin/docker-compose
+                apt-get install -y -qq docker-compose-plugin >> "$LOG_FILE" 2>&1 \
+                    || apt-get install -y -qq docker-compose-v2 >> "$LOG_FILE" 2>&1 \
+                    || true
+
+                if ! docker compose version &> /dev/null; then
+                    install_compose_binary
                 fi
             else
                 current_step=$((current_step + 1))
@@ -198,16 +554,15 @@ install_dependencies() {
                 show_progress $current_step $total_steps "Configuring UFW firewall..."
                 ufw allow 80/tcp >> "$LOG_FILE" 2>&1
                 ufw allow 443/tcp >> "$LOG_FILE" 2>&1
-                ufw allow 5678/tcp >> "$LOG_FILE" 2>&1
             fi
             ;;
             
         centos|rhel|almalinux|rocky)
             if command -v dnf &> /dev/null; then
                 current_step=$((current_step + 1))
-                show_progress $current_step $total_steps "Updating system packages..."
-                dnf -y -q update >> "$LOG_FILE" 2>&1
-                
+                show_progress $current_step $total_steps "Refreshing package metadata..."
+                dnf -y -q makecache >> "$LOG_FILE" 2>&1
+
                 current_step=$((current_step + 1))
                 show_progress $current_step $total_steps "Installing basic utilities..."
                 dnf -y -q install curl wget openssl ca-certificates net-tools bind-utils >> "$LOG_FILE" 2>&1
@@ -220,7 +575,7 @@ install_dependencies() {
                     
                     current_step=$((current_step + 1))
                     show_progress $current_step $total_steps "Installing Docker..."
-                    dnf -y -q install docker-ce docker-ce-cli containerd.io >> "$LOG_FILE" 2>&1
+                    dnf -y -q install docker-ce docker-ce-cli containerd.io docker-compose-plugin >> "$LOG_FILE" 2>&1
                 else
                     current_step=$((current_step + 2))
                     show_progress $current_step $total_steps "Docker already installed..."
@@ -232,8 +587,8 @@ install_dependencies() {
                 dnf -y -q install nginx >> "$LOG_FILE" 2>&1
             else
                 current_step=$((current_step + 1))
-                show_progress $current_step $total_steps "Updating system packages..."
-                yum -y -q update >> "$LOG_FILE" 2>&1
+                show_progress $current_step $total_steps "Refreshing package metadata..."
+                yum -y -q makecache >> "$LOG_FILE" 2>&1
                 
                 current_step=$((current_step + 1))
                 show_progress $current_step $total_steps "Installing basic utilities..."
@@ -247,7 +602,7 @@ install_dependencies() {
                     
                     current_step=$((current_step + 1))
                     show_progress $current_step $total_steps "Installing Docker..."
-                    yum -y -q install docker-ce docker-ce-cli containerd.io >> "$LOG_FILE" 2>&1
+                    yum -y -q install docker-ce docker-ce-cli containerd.io docker-compose-plugin >> "$LOG_FILE" 2>&1
                 else
                     current_step=$((current_step + 2))
                     show_progress $current_step $total_steps "Docker already installed..."
@@ -259,12 +614,10 @@ install_dependencies() {
                 yum -y -q install nginx >> "$LOG_FILE" 2>&1
             fi
             
-            if ! command -v docker-compose &> /dev/null; then
+            if ! docker compose version &> /dev/null && ! command -v docker-compose &> /dev/null; then
                 current_step=$((current_step + 1))
                 show_progress $current_step $total_steps "Installing Docker Compose..."
-                curl -SL https://github.com/docker/compose/releases/download/v2.16.0/docker-compose-linux-x86_64 -o /usr/local/bin/docker-compose >> "$LOG_FILE" 2>&1
-                chmod +x /usr/local/bin/docker-compose
-                ln -sf /usr/local/bin/docker-compose /usr/bin/docker-compose
+                install_compose_binary
             else
                 current_step=$((current_step + 1))
                 show_progress $current_step $total_steps "Docker Compose already installed..."
@@ -289,7 +642,6 @@ install_dependencies() {
                 show_progress $current_step $total_steps "Configuring firewall..."
                 firewall-cmd --permanent --add-service=http >> "$LOG_FILE" 2>&1
                 firewall-cmd --permanent --add-service=https >> "$LOG_FILE" 2>&1
-                firewall-cmd --permanent --add-port=5678/tcp >> "$LOG_FILE" 2>&1
                 firewall-cmd --reload >> "$LOG_FILE" 2>&1
             fi
             ;;
@@ -315,42 +667,44 @@ install_dependencies() {
 # Function to clean previous installation
 clean_installation() {
     echo -e "${YELLOW}🧹 Cleaning previous installation...${NC}"
-    
-    # Stop and remove containers
-    docker stop $(docker ps -q --filter ancestor=n8nio/n8n) 2>/dev/null || true
-    docker rm $(docker ps -aq --filter ancestor=n8nio/n8n) 2>/dev/null || true
-    docker stop n8n postgres 2>/dev/null || true
-    docker rm n8n postgres 2>/dev/null || true
-    docker rm -f n8n-n8n-1 n8n-postgres-1 2>/dev/null || true
-    
-    # Stop using docker-compose if exists
-    if [ -f "$DOCKER_COMPOSE_FILE" ]; then
-        cd $N8N_DIR
-        docker-compose down 2>/dev/null || docker compose down 2>/dev/null || true
+
+    if command -v docker &> /dev/null; then
+        # Stop containers using docker compose if the file exists
+        if [ -f "$DOCKER_COMPOSE_FILE" ]; then
+            (cd "$N8N_DIR" && compose down >> "$LOG_FILE" 2>&1) || true
+        fi
+
+        # Remove containers left over from older versions of this script
+        docker rm -f n8n postgres n8n-n8n-1 n8n-postgres-1 >> "$LOG_FILE" 2>&1 || true
+
+        if [ "$BACKUP_BEFORE_CLEAN" = true ]; then
+            if ! backup_installation; then
+                echo -e "${RED}❌ Backup failed, aborting cleanup${NC}"
+                return 1
+            fi
+        fi
+
+        # Remove only this installation's volumes
+        docker volume rm $N8N_VOLUMES >> "$LOG_FILE" 2>&1 || true
     fi
-    
-    # Remove volumes
-    docker volume rm n8n_data postgres-data 2>/dev/null || true
-    docker volume rm $(docker volume ls -q -f name=n8n) 2>/dev/null || true
-    
-    # Remove nginx config
-    if [[ "$OS" == "ubuntu" || "$OS" == "debian" ]]; then
-        rm -f /etc/nginx/sites-enabled/n8n
-        rm -f /etc/nginx/sites-available/n8n
-    else
-        rm -f /etc/nginx/conf.d/n8n.conf
-    fi
-    
+
+    # Remove nginx config (both layouts, OS may not be detected yet)
+    rm -f /etc/nginx/sites-enabled/n8n
+    rm -f /etc/nginx/sites-available/n8n
+    rm -f /etc/nginx/conf.d/n8n.conf
+
     # Reload nginx
-    nginx -t && systemctl reload nginx 2>/dev/null || true
+    if command -v nginx &> /dev/null && nginx -t >> "$LOG_FILE" 2>&1; then
+        systemctl reload nginx >> "$LOG_FILE" 2>&1 || true
+    fi
     
     # Remove installation directory but keep logs
     if [ -f "$LOG_FILE" ]; then
         cp "$LOG_FILE" "/tmp/n8n_install_backup.log" 2>/dev/null || true
     fi
     
-    rm -rf $N8N_DIR
-    mkdir -p $N8N_DIR
+    rm -rf "$N8N_DIR"
+    mkdir -p "$N8N_DIR"
     
     if [ -f "/tmp/n8n_install_backup.log" ]; then
         mv "/tmp/n8n_install_backup.log" "$LOG_FILE" 2>/dev/null || true
@@ -359,25 +713,32 @@ clean_installation() {
     echo -e "${GREEN}✅ Previous installation cleaned!${NC}"
 }
 
-# Function to create docker-compose file - FIXED
+# Function to create docker-compose file
 create_docker_compose() {
     local domain=$1
     local use_ssl=$2
     local db_pass=$3
-    
+    local encryption_key=$4
+
     local protocol="http"
     local secure_cookie="false"
     local webhook_url="http://${domain}/"
-    
+    local timezone
+    timezone=$(get_timezone)
+
     if [ "$use_ssl" = true ]; then
         protocol="https"
         secure_cookie="true"
         webhook_url="https://${domain}/"
     fi
-    
-    cat > $DOCKER_COMPOSE_FILE <<EOF
-version: "3.7"
 
+    # Installs created by older versions keep the key generated inside the n8n_data volume
+    local encryption_key_line=""
+    if [ -n "$encryption_key" ]; then
+        encryption_key_line="      - N8N_ENCRYPTION_KEY=$encryption_key"
+    fi
+
+    cat > "$DOCKER_COMPOSE_FILE" <<EOF
 services:
   postgres:
     image: $DB_VERSION
@@ -395,10 +756,11 @@ services:
       retries: 5
 
   n8n:
-    image: docker.n8n.io/n8nio/n8n
+    image: $N8N_IMAGE
     restart: always
     ports:
-      - "5678:5678"
+      # Only reachable through the Nginx reverse proxy
+      - "127.0.0.1:5678:5678"
     environment:
       - DB_TYPE=postgresdb
       - DB_POSTGRESDB_HOST=postgres
@@ -412,6 +774,10 @@ services:
       - N8N_PROTOCOL=$protocol
       - WEBHOOK_URL=$webhook_url
       - N8N_EDITOR_BASE_URL=$protocol://$domain/
+      - N8N_PROXY_HOPS=1
+      - GENERIC_TIMEZONE=$timezone
+      - TZ=$timezone
+$encryption_key_line
     depends_on:
       postgres:
         condition: service_healthy
@@ -426,7 +792,7 @@ EOF
     echo -e "${GREEN}✅ Docker Compose file created${NC}"
 }
 
-# Function to configure nginx - IMPROVED
+# Function to configure nginx
 configure_nginx() {
     local domain=$1
     
@@ -435,13 +801,10 @@ configure_nginx() {
     # Stop nginx temporarily
     systemctl stop nginx 2>/dev/null || true
     
-    # Remove ALL existing nginx configs
-    if [[ "$OS" == "ubuntu" || "$OS" == "debian" ]]; then
-        rm -f /etc/nginx/sites-enabled/*
-        rm -f /etc/nginx/sites-available/n8n
-    else
-        rm -f /etc/nginx/conf.d/*.conf
-    fi
+    # Remove only the previous n8n config; other sites on this server are left untouched
+    rm -f /etc/nginx/sites-enabled/n8n
+    rm -f /etc/nginx/sites-available/n8n
+    rm -f /etc/nginx/conf.d/n8n.conf
     
     # Determine Nginx configuration directory
     if [[ "$OS" == "centos" || "$OS" == "rhel" || "$OS" == "almalinux" || "$OS" == "rocky" ]]; then
@@ -457,8 +820,8 @@ configure_nginx() {
     # Create Nginx configuration
     cat > "$NGINX_CONF_FILE" <<'NGINXEOF'
 server {
-    listen 80 default_server;
-    listen [::]:80 default_server;
+    listen 80;
+    listen [::]:80;
     server_name DOMAIN_PLACEHOLDER;
     
     client_max_body_size 50M;
@@ -493,22 +856,22 @@ NGINXEOF
         echo -e "${GREEN}✅ Nginx configuration test passed${NC}"
     else
         echo -e "${RED}❌ Nginx configuration test failed!${NC}"
-        cat "$LOG_FILE" | tail -20
+        tail -20 "$LOG_FILE"
         return 1
     fi
-    
+
     # Start nginx
     echo -e "${CYAN}Starting Nginx...${NC}"
-    systemctl start nginx
-    systemctl enable nginx
-    
+    systemctl start nginx || true
+    systemctl enable nginx >> "$LOG_FILE" 2>&1 || true
+
     # Verify nginx is running
     if systemctl is-active --quiet nginx; then
         echo -e "${GREEN}✅ Nginx is running${NC}"
-        
+
         # Test if nginx can reach n8n
         sleep 2
-        HTTP_CODE=$(curl -s -o /dev/null -w "%{http_code}" http://127.0.0.1:5678 || echo "000")
+        HTTP_CODE=$(curl -s -o /dev/null -w "%{http_code}" -H "Host: $domain" http://127.0.0.1) || HTTP_CODE="000"
         if [[ "$HTTP_CODE" == "200" || "$HTTP_CODE" == "302" ]]; then
             echo -e "${GREEN}✅ n8n is accessible through nginx${NC}"
             return 0
@@ -518,12 +881,12 @@ NGINXEOF
         fi
     else
         echo -e "${RED}❌ Nginx failed to start!${NC}"
-        systemctl status nginx
+        systemctl status nginx --no-pager || true
         return 1
     fi
 }
 
-# Function to install SSL - IMPROVED
+# Function to install SSL
 install_ssl() {
     local domain=$1
     
@@ -534,24 +897,34 @@ install_ssl() {
     if ! command -v certbot &> /dev/null; then
         echo -e "${CYAN}📦 Installing Certbot...${NC}"
         if [[ "$OS" == "ubuntu" || "$OS" == "debian" ]]; then
-            apt-get install -y -qq certbot python3-certbot-nginx >> "$LOG_FILE" 2>&1
+            apt-get install -y -qq certbot python3-certbot-nginx >> "$LOG_FILE" 2>&1 || true
         elif [[ "$OS" == "centos" || "$OS" == "rhel" || "$OS" == "almalinux" || "$OS" == "rocky" ]]; then
+            # Certbot is shipped in EPEL on RHEL-based systems
+            local pkg_manager="yum"
             if command -v dnf &> /dev/null; then
-                dnf -y -q install certbot python3-certbot-nginx >> "$LOG_FILE" 2>&1
-            else
-                yum -y -q install certbot python3-certbot-nginx >> "$LOG_FILE" 2>&1
+                pkg_manager="dnf"
             fi
+            $pkg_manager -y -q install epel-release >> "$LOG_FILE" 2>&1 || true
+            $pkg_manager -y -q install certbot python3-certbot-nginx >> "$LOG_FILE" 2>&1 || true
+        fi
+
+        if ! command -v certbot &> /dev/null; then
+            echo -e "${RED}❌ Failed to install Certbot. Check $LOG_FILE${NC}"
+            return 1
         fi
         echo -e "${GREEN}✅ Certbot installed${NC}"
     fi
-    
+
     # Ensure nginx is running
-    systemctl restart nginx
+    if ! systemctl restart nginx; then
+        echo -e "${RED}❌ Nginx failed to restart${NC}"
+        return 1
+    fi
     sleep 2
-    
+
     # Check if n8n is accessible
     echo -e "${CYAN}🔍 Checking if n8n is accessible...${NC}"
-    HTTP_CODE=$(curl -s -o /dev/null -w "%{http_code}" http://127.0.0.1:5678 2>/dev/null || echo "000")
+    HTTP_CODE=$(curl -s -o /dev/null -w "%{http_code}" http://127.0.0.1:5678 2>/dev/null) || HTTP_CODE="000"
     if [[ "$HTTP_CODE" == "200" || "$HTTP_CODE" == "302" ]]; then
         echo -e "${GREEN}✅ n8n is accessible (HTTP $HTTP_CODE)${NC}"
     else
@@ -560,7 +933,7 @@ install_ssl() {
     
     # Check if domain is accessible via nginx
     echo -e "${CYAN}🔍 Checking if domain is accessible via nginx...${NC}"
-    DOMAIN_HTTP_CODE=$(curl -s -o /dev/null -w "%{http_code}" "http://$domain" 2>/dev/null || echo "000")
+    DOMAIN_HTTP_CODE=$(curl -s -o /dev/null -w "%{http_code}" "http://$domain" 2>/dev/null) || DOMAIN_HTTP_CODE="000"
     if [[ "$DOMAIN_HTTP_CODE" == "200" || "$DOMAIN_HTTP_CODE" == "302" || "$DOMAIN_HTTP_CODE" == "502" ]]; then
         echo -e "${GREEN}✅ Domain is accessible (HTTP $DOMAIN_HTTP_CODE)${NC}"
     else
@@ -576,8 +949,14 @@ install_ssl() {
     echo -e "${CYAN}   This may take a moment...${NC}"
     echo ""
     
-    # Use certbot with nginx plugin
-    if certbot --nginx --non-interactive --agree-tos --register-unsafely-without-email --redirect -d "$domain" 2>&1 | tee -a "$LOG_FILE"; then
+    # Register with an email when one was provided so expiry notices reach someone
+    local email_args=(--register-unsafely-without-email)
+    if [ -n "$SSL_EMAIL" ]; then
+        email_args=(--email "$SSL_EMAIL")
+    fi
+
+    # Use certbot with nginx plugin (pipefail makes a certbot failure fail the pipeline)
+    if certbot --nginx --non-interactive --agree-tos "${email_args[@]}" --redirect -d "$domain" 2>&1 | tee -a "$LOG_FILE"; then
         echo ""
         echo -e "${GREEN}✅ SSL certificate obtained and configured successfully!${NC}"
         
@@ -588,7 +967,7 @@ install_ssl() {
             
             # Test HTTPS access
             sleep 2
-            HTTPS_CODE=$(curl -s -o /dev/null -w "%{http_code}" "https://$domain" 2>/dev/null || echo "000")
+            HTTPS_CODE=$(curl -s -o /dev/null -w "%{http_code}" "https://$domain" 2>/dev/null) || HTTPS_CODE="000"
             if [[ "$HTTPS_CODE" == "200" || "$HTTPS_CODE" == "302" ]]; then
                 echo -e "${GREEN}✅ HTTPS is working! (HTTP $HTTPS_CODE)${NC}"
                 return 0
@@ -620,61 +999,22 @@ install_ssl() {
 start_n8n() {
     echo -e "${CYAN}🚀 Starting n8n containers...${NC}"
     
+    cd "$N8N_DIR"
+    
     # Pull images first
     echo "📥 Pulling Docker images..."
-    docker pull postgres:15 >> "$LOG_FILE" 2>&1 &
-    docker pull docker.n8n.io/n8nio/n8n >> "$LOG_FILE" 2>&1 &
-    wait
+    if ! compose pull >> "$LOG_FILE" 2>&1; then
+        echo -e "${YELLOW}⚠️  Failed to pull images, trying to start with cached images...${NC}"
+    fi
     
-    cd $N8N_DIR
-    
-    # Try docker-compose or docker compose
     echo "🐳 Starting containers with Docker Compose..."
-    if docker-compose up -d 2>&1 | tee -a "$LOG_FILE" || docker compose up -d 2>&1 | tee -a "$LOG_FILE"; then
+    if compose up -d 2>&1 | tee -a "$LOG_FILE"; then
         echo -e "${GREEN}✅ n8n started successfully!${NC}"
         return 0
     else
-        echo -e "${YELLOW}⚠️  Docker Compose failed, trying direct Docker method...${NC}"
-        
-        # Read database password from docker-compose file
-        DB_PASS=$(grep "POSTGRES_PASSWORD" $DOCKER_COMPOSE_FILE | cut -d'=' -f2)
-        DOMAIN=$(grep "N8N_HOST" $DOCKER_COMPOSE_FILE | tail -1 | cut -d'=' -f2)
-        
-        docker volume create n8n_data >> "$LOG_FILE" 2>&1
-        docker volume create postgres-data >> "$LOG_FILE" 2>&1
-        
-        # Start postgres
-        docker run -d --name postgres --restart always \
-          -e POSTGRES_USER=$DB_USER \
-          -e POSTGRES_PASSWORD=$DB_PASS \
-          -e POSTGRES_DB=$DB_NAME \
-          -v postgres-data:/var/lib/postgresql/data \
-          postgres:15 >> "$LOG_FILE" 2>&1
-        
-        sleep 10
-        
-        # Start n8n
-        docker run -d --name n8n --restart always -p 5678:5678 \
-          --link postgres:postgres \
-          -e DB_TYPE=postgresdb \
-          -e DB_POSTGRESDB_HOST=postgres \
-          -e DB_POSTGRESDB_PORT=5432 \
-          -e DB_POSTGRESDB_DATABASE=$DB_NAME \
-          -e DB_POSTGRESDB_USER=$DB_USER \
-          -e DB_POSTGRESDB_PASSWORD=$DB_PASS \
-          -e N8N_HOST=$DOMAIN \
-          -e N8N_PORT=5678 \
-          -v n8n_data:/home/node/.n8n \
-          docker.n8n.io/n8nio/n8n >> "$LOG_FILE" 2>&1
-        
-        if [ $? -eq 0 ]; then
-            echo -e "${GREEN}✅ n8n started using direct Docker method!${NC}"
-            return 0
-        else
-            echo -e "${RED}❌ Failed to start n8n${NC}"
-            echo "Please check the log file: $LOG_FILE"
-            return 1
-        fi
+        echo -e "${RED}❌ Failed to start n8n${NC}"
+        echo "Please check the log file: $LOG_FILE"
+        return 1
     fi
 }
 
@@ -684,10 +1024,10 @@ wait_for_n8n() {
     echo -e "${CYAN}🔍 Waiting for n8n to start (this may take 30-60 seconds)...${NC}"
     
     WAIT_COUNT=0
-    MAX_WAIT=40
+    MAX_WAIT=60
     
     while [ $WAIT_COUNT -lt $MAX_WAIT ]; do
-        if curl -s -o /dev/null -w "%{http_code}" http://localhost:5678 | grep -q "200\|302"; then
+        if curl -s -o /dev/null -w "%{http_code}" http://127.0.0.1:5678 | grep -q "200\|302"; then
             echo -e "${GREEN}✅ n8n is running and responding!${NC}"
             return 0
         fi
@@ -696,10 +1036,10 @@ wait_for_n8n() {
         if [ $WAIT_COUNT -eq $MAX_WAIT ]; then
             echo -e "${YELLOW}⚠️  n8n is taking longer than expected to start${NC}"
             echo "📋 Checking container status..."
-            docker ps -a | grep -E "n8n|postgres"
+            (cd "$N8N_DIR" && compose ps 2>&1) || true
             echo ""
             echo "📋 Checking logs..."
-            docker logs n8n 2>&1 | tail -20
+            show_n8n_logs 20
             return 1
         else
             printf "⏳ Still waiting... (%d/%d)\r" $WAIT_COUNT $MAX_WAIT
@@ -713,15 +1053,26 @@ save_config() {
     local domain=$1
     local has_ssl=$2
     local db_pass=$3
-    
-    cat > $CONFIG_FILE <<EOF
+
+    # ENCRYPTION_KEY and SSL_EMAIL are set by the install flow or loaded from this file
+    cat > "$CONFIG_FILE" <<EOF
 DOMAIN="$domain"
 HAS_SSL="$has_ssl"
 DB_PASSWORD="$db_pass"
+ENCRYPTION_KEY="$ENCRYPTION_KEY"
+SSL_EMAIL="$SSL_EMAIL"
 INSTALLED_DATE="$(date '+%Y-%m-%d %H:%M:%S')"
 EOF
-    
-    chmod 600 $CONFIG_FILE
+
+    chmod 600 "$CONFIG_FILE"
+}
+
+# Load the saved configuration, clearing values older config files may not contain
+load_config() {
+    ENCRYPTION_KEY=""
+    SSL_EMAIL=""
+    # shellcheck source=/dev/null
+    source "$CONFIG_FILE"
 }
 
 # Function to save database info
@@ -754,13 +1105,33 @@ DBEOF
     chmod 600 "$N8N_DIR/database_info.txt"
 }
 
-# Function to install n8n with domain - FIXED
+# Confirm and clean any previous installation
+prepare_installation() {
+    # Ask before removing existing data
+    if ! confirm_clean; then
+        echo -e "${YELLOW}Installation cancelled${NC}"
+        return 1
+    fi
+    
+    # Clean previous installation
+    if [ -d "$N8N_DIR" ]; then
+        if ! clean_installation; then
+            return 1
+        fi
+    else
+        mkdir -p "$N8N_DIR"
+    fi
+}
+
+# Function to install n8n with domain
 install_with_domain() {
     clear
     echo -e "${CYAN}═══════════════════════════════════════════════════════════════${NC}"
     echo -e "${CYAN}       Installing n8n with Domain${NC}"
     echo -e "${CYAN}═══════════════════════════════════════════════════════════════${NC}"
     echo ""
+    
+    detect_os
     
     read -p "Enter your domain name (e.g., n8n.example.com): " DOMAIN
     
@@ -775,23 +1146,37 @@ install_with_domain() {
     echo -e "${GREEN}✅ Domain validated: $DOMAIN${NC}"
     echo ""
     
-    # Generate database password
-    DB_PASS=$(openssl rand -hex 16)
+    # Optional email for Let's Encrypt expiry notices
+    SSL_EMAIL=""
+    read -p "Email for SSL expiry notices (optional, press Enter to skip): " SSL_EMAIL
+    if [ -n "$SSL_EMAIL" ] && [[ ! $SSL_EMAIL =~ ^[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}$ ]]; then
+        echo -e "${YELLOW}⚠️  Invalid email address, continuing without email${NC}"
+        SSL_EMAIL=""
+    fi
+    echo ""
     
-    # Clean previous installation
-    if [ -d "$N8N_DIR" ]; then
-        clean_installation
-    else
-        mkdir -p $N8N_DIR
+    # Generate database password and n8n encryption key
+    DB_PASS=$(openssl rand -hex 16)
+    ENCRYPTION_KEY=$(openssl rand -hex 32)
+    
+    if ! prepare_installation; then
+        read -p "Press Enter to continue..."
+        return
     fi
     
-    # Install dependencies
-    detect_os
+    # Install dependencies (called directly so "set -e" stops on any failure)
     install_dependencies
+    
+    # Offer a registry mirror if Docker Hub is blocked
+    ensure_docker_hub_access
     
     # Create docker-compose file (initially without SSL)
     echo -e "${CYAN}📄 Creating docker-compose configuration...${NC}"
-    create_docker_compose "$DOMAIN" false "$DB_PASS"
+    create_docker_compose "$DOMAIN" false "$DB_PASS" "$ENCRYPTION_KEY"
+    
+    # Save configuration and database info right away so the menu can manage this install
+    save_config "$DOMAIN" "false" "$DB_PASS"
+    save_database_info "$DB_PASS"
     
     # Start n8n FIRST (before nginx)
     echo ""
@@ -810,8 +1195,6 @@ install_with_domain() {
     echo ""
     if ! wait_for_n8n; then
         echo -e "${YELLOW}⚠️  n8n is not responding as expected${NC}"
-        echo -e "${YELLOW}Checking container logs...${NC}"
-        docker logs n8n 2>&1 | tail -30
         echo ""
         read -p "Press Enter to continue anyway..."
     fi
@@ -826,9 +1209,8 @@ install_with_domain() {
     if ! configure_nginx "$DOMAIN"; then
         echo -e "${RED}❌ Nginx configuration failed${NC}"
         echo ""
-        echo -e "${YELLOW}Checking if n8n is still accessible directly:${NC}"
-        SERVER_IP=$(hostname -I | awk '{print $1}')
-        echo -e "Try accessing: ${GREEN}http://$SERVER_IP:5678${NC}"
+        echo -e "${YELLOW}n8n is running locally on 127.0.0.1:5678 but is not reachable from outside.${NC}"
+        echo -e "${YELLOW}Check the Nginx configuration and the log file: $LOG_FILE${NC}"
         echo ""
         read -p "Press Enter to continue..."
         return
@@ -838,7 +1220,7 @@ install_with_domain() {
     echo ""
     echo -e "${CYAN}Testing domain access...${NC}"
     sleep 3
-    HTTP_CODE=$(curl -s -o /dev/null -w "%{http_code}" "http://$DOMAIN" 2>/dev/null || echo "000")
+    HTTP_CODE=$(curl -s -o /dev/null -w "%{http_code}" "http://$DOMAIN" 2>/dev/null) || HTTP_CODE="000"
     
     if [[ "$HTTP_CODE" == "200" || "$HTTP_CODE" == "302" ]]; then
         echo -e "${GREEN}✅ Domain is accessible! HTTP Code: $HTTP_CODE${NC}"
@@ -862,15 +1244,8 @@ install_with_domain() {
         echo -e "${CYAN}🔄 Updating n8n configuration for HTTPS...${NC}"
         
         # Update docker-compose with HTTPS
-        create_docker_compose "$DOMAIN" true "$DB_PASS"
-        
-        echo -e "${CYAN}🔄 Restarting n8n with HTTPS configuration...${NC}"
-        cd $N8N_DIR
-        docker-compose down >> "$LOG_FILE" 2>&1 || docker compose down >> "$LOG_FILE" 2>&1
-        sleep 3
-        docker-compose up -d >> "$LOG_FILE" 2>&1 || docker compose up -d >> "$LOG_FILE" 2>&1
-        
-        wait_for_n8n
+        create_docker_compose "$DOMAIN" true "$DB_PASS" "$ENCRYPTION_KEY"
+        restart_n8n || true
         
         save_config "$DOMAIN" "true" "$DB_PASS"
         ACCESS_URL="https://$DOMAIN"
@@ -887,9 +1262,6 @@ install_with_domain() {
         SSL_STATUS="${YELLOW}❌ Disabled (HTTP only)${NC}"
     fi
     
-    # Save database info
-    save_database_info "$DB_PASS"
-    
     # Final message
     echo ""
     echo -e "${GREEN}═══════════════════════════════════════════════════════════════${NC}"
@@ -900,7 +1272,7 @@ install_with_domain() {
     echo -e "🔐 SSL Status: $SSL_STATUS"
     echo ""
     echo -e "📊 Service Status:"
-    docker ps --filter "name=n8n" --format "   {{.Names}} - {{.Status}}"
+    docker ps --filter "name=n8n" --format "   {{.Names}} - {{.Status}}" || true
     echo ""
     echo -e "📊 Database Information:"
     echo "   Type:     $DB_TYPE"
@@ -909,7 +1281,7 @@ install_with_domain() {
     echo "   Password: $DB_PASS"
     echo ""
     echo -e "📁 Files:"
-    echo "   Config:   $CONFIG_FILE"
+    echo "   Config:   $CONFIG_FILE (includes the n8n encryption key - keep it safe)"
     echo "   Database: $N8N_DIR/database_info.txt"
     echo "   Log:      $LOG_FILE"
     echo ""
@@ -935,44 +1307,55 @@ install_without_domain() {
     echo -e "${CYAN}═══════════════════════════════════════════════════════════════${NC}"
     echo ""
     
+    detect_os
+    
     # Get server IP automatically
-    SERVER_IP=$(hostname -I | awk '{print $1}')
+    SERVER_IP=$(get_server_ip)
     echo -e "🌐 Server IP: ${GREEN}$SERVER_IP${NC}"
     echo ""
     
-    # Generate database password
+    # Generate database password and n8n encryption key
     DB_PASS=$(openssl rand -hex 16)
+    ENCRYPTION_KEY=$(openssl rand -hex 32)
+    SSL_EMAIL=""
     
-    # Clean previous installation
-    if [ -d "$N8N_DIR" ]; then
-        clean_installation
-    else
-        mkdir -p $N8N_DIR
+    if ! prepare_installation; then
+        read -p "Press Enter to continue..."
+        return
     fi
     
-    # Install dependencies
-    detect_os
+    # Install dependencies (called directly so "set -e" stops on any failure)
     install_dependencies
+    
+    # Offer a registry mirror if Docker Hub is blocked
+    ensure_docker_hub_access
     
     # Create docker-compose file
     echo -e "${CYAN}📄 Creating docker-compose configuration...${NC}"
-    create_docker_compose "$SERVER_IP" false "$DB_PASS"
+    create_docker_compose "$SERVER_IP" false "$DB_PASS" "$ENCRYPTION_KEY"
+    
+    # Save configuration and database info
+    save_config "$SERVER_IP" "false" "$DB_PASS"
+    save_database_info "$DB_PASS"
+    
+    # Start n8n
+    if ! start_n8n; then
+        read -p "Press Enter to continue..."
+        return
+    fi
+    
+    # Wait for n8n to be ready
+    if ! wait_for_n8n; then
+        echo -e "${YELLOW}⚠️  n8n is not responding yet, it may need more time to start${NC}"
+    fi
     
     # Configure nginx
     echo -e "${CYAN}🌐 Configuring Nginx...${NC}"
-    configure_nginx "$SERVER_IP"
-    
-    # Start n8n
-    start_n8n
-    
-    # Wait for n8n to be ready
-    wait_for_n8n
-    
-    # Save configuration
-    save_config "$SERVER_IP" "false" "$DB_PASS"
-    
-    # Save database info
-    save_database_info "$DB_PASS"
+    if ! configure_nginx "$SERVER_IP"; then
+        echo -e "${RED}❌ Nginx configuration failed. Check $LOG_FILE${NC}"
+        read -p "Press Enter to continue..."
+        return
+    fi
     
     ACCESS_URL="http://$SERVER_IP"
     
@@ -983,12 +1366,10 @@ install_without_domain() {
     echo -e "${GREEN}═══════════════════════════════════════════════════════════════${NC}"
     echo ""
     echo -e "🌍 Access n8n at: ${GREEN}$ACCESS_URL${NC}"
-    echo -e "🌍 Alternative: ${GREEN}http://$SERVER_IP:5678${NC}"
     echo ""
     echo -e "⚠️  ${YELLOW}IMPORTANT:${NC} If using a cloud provider, open these ports:"
     echo "   • Port 80 (HTTP)"
     echo "   • Port 443 (HTTPS) - for future SSL"
-    echo "   • Port 5678 (n8n direct access)"
     echo ""
     echo -e "📊 Database Information:"
     echo "   Type:     $DB_TYPE"
@@ -997,12 +1378,42 @@ install_without_domain() {
     echo "   Password: $DB_PASS"
     echo ""
     echo -e "🔐 Database info saved to: $N8N_DIR/database_info.txt"
+    echo -e "🔑 Config (includes the n8n encryption key): $CONFIG_FILE"
     echo -e "📜 Installation log: $LOG_FILE"
     echo ""
     read -p "Press Enter to continue..."
 }
 
-# Function to change domain - IMPROVED
+# Point n8n at a domain over HTTP, then try to upgrade it to HTTPS
+apply_domain() {
+    local new_domain=$1
+    
+    # Update docker-compose
+    create_docker_compose "$new_domain" false "$DB_PASSWORD" "$ENCRYPTION_KEY"
+    
+    # Configure nginx
+    if ! configure_nginx "$new_domain"; then
+        echo -e "${RED}❌ Nginx configuration failed. Check $LOG_FILE${NC}"
+        return 1
+    fi
+    
+    # Restart n8n
+    restart_n8n || true
+    save_config "$new_domain" "false" "$DB_PASSWORD"
+    
+    # Try to install SSL
+    if install_ssl "$new_domain"; then
+        create_docker_compose "$new_domain" true "$DB_PASSWORD" "$ENCRYPTION_KEY"
+        restart_n8n || true
+        save_config "$new_domain" "true" "$DB_PASSWORD"
+        echo -e "${GREEN}✅ n8n is available at: https://$new_domain${NC}"
+    else
+        echo -e "${YELLOW}⚠️  SSL installation failed. Running with HTTP.${NC}"
+        echo -e "${GREEN}✅ n8n is available at: http://$new_domain${NC}"
+    fi
+}
+
+# Function to change domain
 change_domain() {
     clear
     echo -e "${CYAN}═══════════════════════════════════════════════════════════════${NC}"
@@ -1018,9 +1429,9 @@ change_domain() {
     fi
     
     # Load current configuration
-    source $CONFIG_FILE
-    
-    SERVER_IP=$(hostname -I | awk '{print $1}')
+    load_config
+    detect_os
+    echo ""
     
     echo -e "Current configuration:"
     if [[ "$DOMAIN" =~ ^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
@@ -1045,39 +1456,7 @@ change_domain() {
                 
                 echo ""
                 echo -e "${CYAN}🔄 Switching to domain: $NEW_DOMAIN${NC}"
-                
-                # Update docker-compose
-                create_docker_compose "$NEW_DOMAIN" false "$DB_PASSWORD"
-                
-                # Configure nginx
-                configure_nginx "$NEW_DOMAIN"
-                
-                # Restart n8n
-                echo -e "${CYAN}🔄 Restarting n8n...${NC}"
-                cd $N8N_DIR
-                docker-compose down >> "$LOG_FILE" 2>&1 || docker compose down >> "$LOG_FILE" 2>&1
-                sleep 3
-                docker-compose up -d >> "$LOG_FILE" 2>&1 || docker compose up -d >> "$LOG_FILE" 2>&1
-                
-                wait_for_n8n
-                
-                # Try to install SSL
-                if install_ssl "$NEW_DOMAIN"; then
-                    create_docker_compose "$NEW_DOMAIN" true "$DB_PASSWORD"
-                    
-                    cd $N8N_DIR
-                    docker-compose down >> "$LOG_FILE" 2>&1 || docker compose down >> "$LOG_FILE" 2>&1
-                    sleep 3
-                    docker-compose up -d >> "$LOG_FILE" 2>&1 || docker compose up -d >> "$LOG_FILE" 2>&1
-                    
-                    wait_for_n8n
-                    
-                    save_config "$NEW_DOMAIN" "true" "$DB_PASSWORD"
-                    echo -e "${GREEN}✅ Successfully switched to: https://$NEW_DOMAIN${NC}"
-                else
-                    save_config "$NEW_DOMAIN" "false" "$DB_PASSWORD"
-                    echo -e "${GREEN}✅ Successfully switched to: http://$NEW_DOMAIN${NC}"
-                fi
+                apply_domain "$NEW_DOMAIN" || true
                 ;;
             2)
                 return
@@ -1115,66 +1494,31 @@ change_domain() {
                 # Remove old SSL certificate if exists
                 if [ "$HAS_SSL" = "true" ]; then
                     echo -e "${CYAN}🔐 Removing old SSL certificate...${NC}"
-                    certbot delete --cert-name $DOMAIN --non-interactive >> "$LOG_FILE" 2>&1 || true
+                    certbot delete --cert-name "$DOMAIN" --non-interactive >> "$LOG_FILE" 2>&1 || true
                 fi
                 
-                # Update docker-compose
-                create_docker_compose "$NEW_DOMAIN" false "$DB_PASSWORD"
-                
-                # Configure nginx
-                configure_nginx "$NEW_DOMAIN"
-                
-                # Restart n8n
-                echo -e "${CYAN}🔄 Restarting n8n...${NC}"
-                cd $N8N_DIR
-                docker-compose down >> "$LOG_FILE" 2>&1 || docker compose down >> "$LOG_FILE" 2>&1
-                sleep 3
-                docker-compose up -d >> "$LOG_FILE" 2>&1 || docker compose up -d >> "$LOG_FILE" 2>&1
-                
-                wait_for_n8n
-                
-                # Try to install SSL
-                if install_ssl "$NEW_DOMAIN"; then
-                    create_docker_compose "$NEW_DOMAIN" true "$DB_PASSWORD"
-                    
-                    cd $N8N_DIR
-                    docker-compose down >> "$LOG_FILE" 2>&1 || docker compose down >> "$LOG_FILE" 2>&1
-                    sleep 3
-                    docker-compose up -d >> "$LOG_FILE" 2>&1 || docker compose up -d >> "$LOG_FILE" 2>&1
-                    
-                    wait_for_n8n
-                    
-                    save_config "$NEW_DOMAIN" "true" "$DB_PASSWORD"
-                    echo -e "${GREEN}✅ Successfully changed to: https://$NEW_DOMAIN${NC}"
-                else
-                    save_config "$NEW_DOMAIN" "false" "$DB_PASSWORD"
-                    echo -e "${GREEN}✅ Successfully changed to: http://$NEW_DOMAIN${NC}"
-                fi
+                apply_domain "$NEW_DOMAIN" || true
                 ;;
             2)
+                SERVER_IP=$(get_server_ip)
                 echo ""
                 echo -e "${CYAN}🔄 Switching to IP address: $SERVER_IP${NC}"
                 
                 # Remove SSL certificate if exists
                 if [ "$HAS_SSL" = "true" ]; then
                     echo -e "${CYAN}🔐 Removing SSL certificate...${NC}"
-                    certbot delete --cert-name $DOMAIN --non-interactive >> "$LOG_FILE" 2>&1 || true
+                    certbot delete --cert-name "$DOMAIN" --non-interactive >> "$LOG_FILE" 2>&1 || true
                 fi
                 
                 # Update docker-compose
-                create_docker_compose "$SERVER_IP" false "$DB_PASSWORD"
+                create_docker_compose "$SERVER_IP" false "$DB_PASSWORD" "$ENCRYPTION_KEY"
                 
                 # Configure nginx
-                configure_nginx "$SERVER_IP"
+                if ! configure_nginx "$SERVER_IP"; then
+                    echo -e "${RED}❌ Nginx configuration failed. Check $LOG_FILE${NC}"
+                fi
                 
-                # Restart n8n
-                echo -e "${CYAN}🔄 Restarting n8n...${NC}"
-                cd $N8N_DIR
-                docker-compose down >> "$LOG_FILE" 2>&1 || docker compose down >> "$LOG_FILE" 2>&1
-                sleep 3
-                docker-compose up -d >> "$LOG_FILE" 2>&1 || docker compose up -d >> "$LOG_FILE" 2>&1
-                
-                wait_for_n8n
+                restart_n8n || true
                 
                 save_config "$SERVER_IP" "false" "$DB_PASSWORD"
                 echo -e "${GREEN}✅ Successfully switched to: http://$SERVER_IP${NC}"
@@ -1184,38 +1528,9 @@ change_domain() {
                 echo -e "${CYAN}🔄 Reinstalling SSL certificate for: $DOMAIN${NC}"
                 
                 # Remove old certificate
-                certbot delete --cert-name $DOMAIN --non-interactive >> "$LOG_FILE" 2>&1 || true
+                certbot delete --cert-name "$DOMAIN" --non-interactive >> "$LOG_FILE" 2>&1 || true
                 
-                # Update to HTTP first
-                create_docker_compose "$DOMAIN" false "$DB_PASSWORD"
-                configure_nginx "$DOMAIN"
-                
-                cd $N8N_DIR
-                docker-compose down >> "$LOG_FILE" 2>&1 || docker compose down >> "$LOG_FILE" 2>&1
-                sleep 3
-                docker-compose up -d >> "$LOG_FILE" 2>&1 || docker compose up -d >> "$LOG_FILE" 2>&1
-                
-                wait_for_n8n
-                
-                # Install SSL
-                if install_ssl "$DOMAIN"; then
-                    create_docker_compose "$DOMAIN" true "$DB_PASSWORD"
-                    
-                    cd $N8N_DIR
-                    docker-compose down >> "$LOG_FILE" 2>&1 || docker compose down >> "$LOG_FILE" 2>&1
-                    sleep 3
-                    docker-compose up -d >> "$LOG_FILE" 2>&1 || docker compose up -d >> "$LOG_FILE" 2>&1
-                    
-                    wait_for_n8n
-                    
-                    save_config "$DOMAIN" "true" "$DB_PASSWORD"
-                    echo -e "${GREEN}✅ SSL certificate reinstalled successfully!${NC}"
-                    echo -e "${GREEN}✅ Access at: https://$DOMAIN${NC}"
-                else
-                    save_config "$DOMAIN" "false" "$DB_PASSWORD"
-                    echo -e "${YELLOW}⚠️  SSL installation failed. Running with HTTP.${NC}"
-                    echo -e "${YELLOW}⚠️  Access at: http://$DOMAIN${NC}"
-                fi
+                apply_domain "$DOMAIN" || true
                 ;;
             4)
                 return
@@ -1245,7 +1560,18 @@ reinstall_n8n() {
     if [[ ! $REPLY =~ ^[Yy]$ ]]; then
         return
     fi
-    
+
+    read -p "Create a backup of the existing data first? (Y/n): " -n 1 -r
+    echo
+    if [[ ! $REPLY =~ ^[Nn]$ ]]; then
+        BACKUP_BEFORE_CLEAN=true
+    else
+        BACKUP_BEFORE_CLEAN=false
+    fi
+
+    # Already confirmed above, don't ask again during installation
+    SKIP_CLEAN_CONFIRM=true
+
     echo ""
     echo "Choose installation type:"
     echo "  1. Install with domain"
@@ -1269,6 +1595,9 @@ reinstall_n8n() {
             read -p "Press Enter to continue..."
             ;;
     esac
+    
+    SKIP_CLEAN_CONFIRM=false
+    BACKUP_BEFORE_CLEAN=false
 }
 
 # Function to show status
@@ -1286,7 +1615,7 @@ show_status() {
         return
     fi
     
-    source $CONFIG_FILE
+    load_config
     
     echo -e "${GREEN}Configuration:${NC}"
     echo "  Domain/IP: $DOMAIN"
@@ -1295,9 +1624,7 @@ show_status() {
     echo ""
     
     echo -e "${GREEN}Container Status:${NC}"
-    docker ps --filter "name=n8n" --format "table {{.Names}}\t{{.Status}}\t{{.Ports}}"
-    echo ""
-    docker ps --filter "name=postgres" --format "table {{.Names}}\t{{.Status}}\t{{.Ports}}"
+    (cd "$N8N_DIR" && compose ps 2>&1) || true
     echo ""
     
     if [ "$HAS_SSL" = "true" ]; then
@@ -1308,6 +1635,11 @@ show_status() {
     echo ""
     
     echo -e "${GREEN}Database:${NC} $DB_TYPE"
+    echo ""
+    
+    local mirrors
+    mirrors=$(get_docker_mirrors | paste -sd ' ' -)
+    echo -e "${GREEN}Docker mirror:${NC} ${mirrors:-none}"
     echo ""
     
     if [ -f "$N8N_DIR/database_info.txt" ]; then
@@ -1338,7 +1670,7 @@ show_menu() {
         
         # Check if n8n is installed
         if [ -f "$CONFIG_FILE" ]; then
-            source $CONFIG_FILE
+            load_config
             echo -e "Status: ${GREEN}✅ Installed${NC}"
             echo -e "Domain/IP: ${GREEN}$DOMAIN${NC}"
             if [ "$HAS_SSL" = "true" ]; then
@@ -1348,7 +1680,7 @@ show_menu() {
             fi
             
             # Check if containers are running
-            if docker ps | grep -q "n8n"; then
+            if docker ps --format '{{.Names}}' 2>/dev/null | grep -q "n8n"; then
                 echo -e "Service: ${GREEN}🟢 Running${NC}"
             else
                 echo -e "Service: ${RED}🔴 Stopped${NC}"
@@ -1365,11 +1697,12 @@ show_menu() {
         echo "  3. Reinstall n8n"
         echo "  4. Change n8n domain"
         echo "  5. Show status & info"
-        echo "  6. Exit"
+        echo "  6. Docker registry mirror"
+        echo "  7. Exit"
         echo ""
         echo "════════════════════════════════════════"
         echo ""
-        read -p "Choose an option (1-6): " choice
+        read -p "Choose an option (1-7): " choice
         
         case $choice in
             1)
@@ -1388,6 +1721,9 @@ show_menu() {
                 show_status
                 ;;
             6)
+                manage_docker_mirror
+                ;;
+            7)
                 echo ""
                 echo -e "${GREEN}👋 Goodbye!${NC}"
                 echo ""
@@ -1421,7 +1757,7 @@ first_time_setup() {
     # Create service command
     echo -e "${CYAN}📦 Creating n8n service command...${NC}"
     
-    cat > $SERVICE_FILE <<'EOFSERVICE'
+    cat > "$SERVICE_FILE" <<'EOFSERVICE'
 #!/bin/bash
 
 # n8n Service Management Script
@@ -1441,11 +1777,10 @@ fi
 bash "$N8N_SCRIPT"
 EOFSERVICE
     
-    chmod +x $SERVICE_FILE
+    chmod +x "$SERVICE_FILE"
     
     # Copy this script to persistent location
-    cp "$0" /opt/n8n_service.sh
-    chmod +x /opt/n8n_service.sh
+    install_service_script
     
     echo -e "${GREEN}✅ n8n service command created successfully!${NC}"
     echo ""
@@ -1462,18 +1797,58 @@ EOFSERVICE
     echo "   • Reinstall n8n"
     echo "   • Change domain settings"
     echo "   • View status and information"
+    echo "   • Set a Docker registry mirror"
     echo ""
     echo -e "${YELLOW}⚠️  Always use 'sudo n8n' to manage your installation${NC}"
     echo ""
+    
+    read -p "Open the management menu now? (Y/n): " -n 1 -r
+    echo
+    if [[ ! $REPLY =~ ^[Nn]$ ]]; then
+        show_menu
+    fi
+}
+
+# Copy the running script to $SERVICE_SCRIPT (downloads it when run through a pipe)
+install_service_script() {
+    if [ -f "$0" ]; then
+        if [ "$(realpath "$0")" != "$SERVICE_SCRIPT" ]; then
+            cp "$0" "$SERVICE_SCRIPT"
+        fi
+    elif [ ! -f "$SERVICE_SCRIPT" ]; then
+        curl -fsSL "$SCRIPT_URL" -o "$SERVICE_SCRIPT"
+    fi
+    chmod +x "$SERVICE_SCRIPT"
+}
+
+# Report unexpected exits caused by "set -e"
+on_exit() {
+    local status=$?
+    if [ $status -ne 0 ] && [ $status -ne 130 ]; then
+        echo ""
+        echo -e "${RED}❌ The script stopped because of an unexpected error (exit code $status)${NC}"
+        echo -e "${YELLOW}Check the log file for details: $LOG_FILE${NC}"
+    fi
 }
 
 # Main execution
 main() {
+    trap on_exit EXIT
+    
+    # Don't overwrite an unrelated "n8n" command (e.g. n8n installed with npm)
+    if [ -f "$SERVICE_FILE" ] && ! grep -q "$SERVICE_MARKER" "$SERVICE_FILE"; then
+        echo -e "${RED}❌ $SERVICE_FILE already exists and was not created by this installer${NC}"
+        echo -e "${YELLOW}It may be an n8n installation from npm. Remove or rename it, then run this script again.${NC}"
+        exit 1
+    fi
+    
     # Check if this is first time setup or service menu
     if [ ! -f "$SERVICE_FILE" ]; then
         # First time setup
         first_time_setup
     else
+        # Running a newer copy of the installer updates the management script
+        install_service_script
         # Show service menu
         show_menu
     fi
